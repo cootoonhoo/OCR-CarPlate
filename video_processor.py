@@ -2,13 +2,16 @@ import cv2
 from ultralytics import YOLO
 import time
 import os
+import pytesseract
+import re
+import numpy as np
 
 class VideoProcessor:
     """
     Classe para processar vídeos e detectar objetos usando YOLOv8
     """
     
-    def __init__(self, model_name="yolov8n.pt", conf_threshold=0.25, save_interval=0.5):
+    def __init__(self, model_name="yolov8n.pt", conf_threshold=0.25, save_interval=0.5, tesseract_cmd=None):
         """
         Inicializa o processador de vídeo
         
@@ -16,20 +19,30 @@ class VideoProcessor:
             model_name (str): Nome do modelo YOLO a ser usado
             conf_threshold (float): Limiar de confiança para detecções (0.1 a 1.0)
             save_interval (float): Intervalo mínimo em segundos entre salvamentos de um mesmo tipo de objeto
+            tesseract_cmd (str): Caminho para o executável do Tesseract OCR (se None, usa o padrão)
         """
         self.model_name = model_name
         self.conf_threshold = conf_threshold
         self.save_interval = save_interval
         self.model = None
+        
+        # Configuração do Tesseract OCR
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+            
         self.processing_stats = {
             'frames_processed': 0,
             'total_time': 0,
             'processing_times': [],
             'detected_objects': {},
-            'saved_crops': 0
+            'saved_crops': 0,
+            'ocr_results': {}  # Armazena resultados do OCR por timestamp
         }
         # Dicionário para rastrear o último timestamp em que cada classe foi salva
         self.last_saved_time = {}
+        
+        # Lista para armazenar os resultados do OCR com seus metadados
+        self.ocr_results_list = []
     
     def load_model(self):
         """
@@ -47,9 +60,9 @@ class VideoProcessor:
             print(f"Erro ao carregar o modelo: {e}")
             return False
     
-    def process_video(self, video_path, save_output=True, display=True, output_path=None, save_crops=False, crops_dir=None, target_class="license_plate"):
+    def process_video(self, video_path, save_output=True, display=True, output_path=None, save_crops=False, crops_dir=None):
         """
-        Processa um vídeo para detectar objetos
+        Processa um vídeo para detectar placas de licença
         
         Args:
             video_path (str): Caminho para o arquivo de vídeo
@@ -57,10 +70,9 @@ class VideoProcessor:
             display (bool): Se True, exibe o vídeo durante o processamento
             output_path (str, optional): Caminho personalizado para o vídeo de saída
                                         Se None, gera um nome baseado no vídeo original
-            save_crops (bool): Se True, salva imagens recortadas dos objetos detectados
+            save_crops (bool): Se True, salva imagens recortadas das placas detectadas
             crops_dir (str, optional): Diretório para salvar os recortes
                                      Se None, cria um diretório baseado no nome do vídeo
-            target_class (str): Classe alvo para detecção (por padrão "placa")
         
         Returns:
             str: Caminho para o vídeo de saída, se save_output=True
@@ -150,7 +162,7 @@ class VideoProcessor:
             results = self.model(frame, conf=self.conf_threshold)
             
             # Atualiza estatísticas de objetos detectados e salva recortes
-            self._update_detection_stats(results[0], frame, frame_number, video_timestamp, save_crops, crops_dir, target_class)
+            self._update_detection_stats(results[0], frame, frame_number, video_timestamp, save_crops, crops_dir)
             
             # Desenha os resultados no frame
             annotated_frame = results[0].plot()
@@ -203,7 +215,7 @@ class VideoProcessor:
         
         return final_output_path, self.processing_stats
     
-    def _update_detection_stats(self, result, frame, frame_number, video_timestamp, save_crops=False, crops_dir=None, target_class="placa"):
+    def _update_detection_stats(self, result, frame, frame_number, video_timestamp, save_crops=False, crops_dir=None):
         """
         Atualiza as estatísticas de objetos detectados e salva recortes
         
@@ -214,7 +226,6 @@ class VideoProcessor:
             video_timestamp: Timestamp atual do vídeo em segundos
             save_crops: Se True, salva recortes dos objetos detectados
             crops_dir: Diretório para salvar os recortes
-            target_class: Classe alvo para detecção (por padrão "placa")
         """
         # Conta os objetos detectados por classe e salva recortes
         for i, box in enumerate(result.boxes):
@@ -230,26 +241,18 @@ class VideoProcessor:
             
             # Salva recortes dos objetos detectados
             if save_crops and crops_dir:
-                # Verifica se a classe do objeto é a que estamos procurando (considerando diferentes nomenclaturas possíveis)
-                # Verificação case-insensitive e parcial para capturar variações como "placa", "placas", "license_plate", etc.
-                should_save = False
+                # Verifica o intervalo de tempo desde o último salvamento desta classe
+                current_time = video_timestamp
+                last_time = self.last_saved_time.get(cls_name, -self.save_interval)  # -interval para garantir que a primeira detecção seja salva
                 
-                # Verifique se a classe atual corresponde ao alvo (sem diferenciar maiúsculas/minúsculas)
-                if (target_class.lower() in cls_name.lower() or 
-                    cls_name.lower() in target_class.lower() or
-                    cls_name.lower() == target_class.lower()):
+                # Salva apenas se passado o intervalo de tempo mínimo desde o último salvamento
+                should_save = False
+                if current_time - last_time >= self.save_interval:
+                    should_save = True
+                    self.last_saved_time[cls_name] = current_time
                     
-                    # Verifica o intervalo de tempo desde o último salvamento desta classe
-                    current_time = video_timestamp
-                    last_time = self.last_saved_time.get(cls_name, -self.save_interval)  # -interval para garantir que a primeira detecção seja salva
-                    
-                    # Salva apenas se passado o intervalo de tempo mínimo desde o último salvamento
-                    if current_time - last_time >= self.save_interval:
-                        should_save = True
-                        self.last_saved_time[cls_name] = current_time
-                        
-                        # Log para depuração
-                        print(f"Salvando {cls_name} no timestamp {current_time:.2f}s (último salvo: {last_time:.2f}s)")
+                    # Log para depuração
+                    print(f"Salvando {cls_name} no timestamp {current_time:.2f}s (último salvo: {last_time:.2f}s)")
                 
                 if should_save:
                     # Obtém as coordenadas da caixa delimitadora
@@ -263,18 +266,201 @@ class VideoProcessor:
                     # Extrai o recorte do objeto
                     crop = frame[y1:y2, x1:x2]
                     
+                    # Realiza o pré-processamento para OCR - agora retorna 3 versões
+                    preprocessed1, preprocessed2, preprocessed3 = self._preprocess_for_ocr(crop)
+                    
+                    # Tenta OCR em cada versão pré-processada para maximizar a chance de sucesso
+                    plate_text1, confidence1 = self._recognize_plate(preprocessed1)
+                    plate_text2, confidence2 = self._recognize_plate(preprocessed2)
+                    plate_text3, confidence3 = self._recognize_plate(preprocessed3)
+                    
+                    # Escolhe o resultado com a maior confiança ou o texto mais longo
+                    best_plate_text = ""
+                    best_confidence = 0
+                    best_preprocessed = preprocessed1
+                    
+                    # Critério: texto mais longo ganha, ou maior confiança em caso de empate
+                    candidates = [
+                        (plate_text1, confidence1, preprocessed1),
+                        (plate_text2, confidence2, preprocessed2),
+                        (plate_text3, confidence3, preprocessed3)
+                    ]
+                    
+                    for text, conf, img in candidates:
+                        if len(text) > len(best_plate_text) or (len(text) == len(best_plate_text) and conf > best_confidence):
+                            best_plate_text = text
+                            best_confidence = conf
+                            best_preprocessed = img
+                    
                     # Cria diretório para a classe se não existir
                     class_dir = os.path.join(crops_dir, cls_name)
                     os.makedirs(class_dir, exist_ok=True)
                     
-                    # Salva o recorte
+                    # Adiciona o texto reconhecido ao nome do arquivo
                     time_str = f"{video_timestamp:.2f}".replace(".", "_")
-                    crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
+                    plate_text_clean = best_plate_text.replace(" ", "").replace("\n", "")
+                    
+                    if plate_text_clean:
+                        crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}_OCR_{plate_text_clean}.jpg"
+                    else:
+                        crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
+                    
                     crop_path = os.path.join(class_dir, crop_filename)
                     cv2.imwrite(crop_path, crop)
                     
+                    # Salva também a imagem pré-processada que deu o melhor resultado
+                    preproc_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_preprocessed.jpg"
+                    preproc_path = os.path.join(class_dir, preproc_filename)
+                    cv2.imwrite(preproc_path, best_preprocessed)
+                    
+                    # Armazena os resultados do OCR
+                    ocr_result = {
+                        'timestamp': current_time,
+                        'frame': frame_number,
+                        'class': cls_name,
+                        'confidence': conf,
+                        'ocr_text': best_plate_text,
+                        'ocr_confidence': best_confidence,
+                        'image_path': crop_path,
+                        'coordinates': (x1, y1, x2, y2)
+                    }
+                    
+                    self.ocr_results_list.append(ocr_result)
+                    
                     # Atualiza contador de recortes salvos
                     self.processing_stats['saved_crops'] += 1
+    
+    def _preprocess_for_ocr(self, image):
+        """
+        Pré-processa a imagem para melhorar o reconhecimento de OCR
+        
+        Args:
+            image: Imagem da placa recortada
+            
+        Returns:
+            Imagem pré-processada pronta para OCR
+        """
+        try:
+            # Converte para escala de cinza
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Redimensiona a imagem (opcional, mas pode ajudar com placas pequenas)
+            scale_factor = max(1, 600 / max(gray.shape[0], gray.shape[1]))
+            if scale_factor > 1:
+                width = int(gray.shape[1] * scale_factor)
+                height = int(gray.shape[0] * scale_factor)
+                gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_CUBIC)
+            
+            # Versão 1: Pré-processamento tradicional
+            # Aplicar blur para reduzir ruído
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # Aplicar threshold adaptativo para binarizar a imagem
+            binary = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+            )
+            
+            # Operações morfológicas para remover ruído
+            kernel = np.ones((3, 3), np.uint8)
+            opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            # Dilatar um pouco para conectar componentes próximos
+            preprocessed1 = cv2.dilate(opening, kernel, iterations=1)
+            
+            # Versão 2: Equalização de histograma
+            # Equaliza o histograma para melhorar o contraste
+            equalized = cv2.equalizeHist(gray)
+            
+            # Aplicar Otsu's thresholding
+            _, preprocessed2 = cv2.threshold(equalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Versão 3: Thresholding simples
+            # Aplica uma simples binarização
+            _, preprocessed3 = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Retorna a versão 1 como padrão, mas tenta as outras versões no reconhecimento
+            return preprocessed1, preprocessed2, preprocessed3
+        except Exception as e:
+            print(f"Erro no pré-processamento: {e}")
+            return image, image, image  # Retorna a imagem original em caso de erro
+    
+    def _recognize_plate(self, preprocessed_image):
+        """
+        Reconhece o texto da placa usando OCR
+        
+        Args:
+            preprocessed_image: Imagem pré-processada da placa
+            
+        Returns:
+            texto: Texto reconhecido na placa
+            confidence: Confiança da detecção
+        """
+        try:
+            # Configurações para o Tesseract
+            # PSM 7: Trata a imagem como uma única linha de texto
+            # PSM 8: Trata a imagem como uma única palavra
+            # PSM 6: Assume um único bloco de texto uniforme
+            custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            
+            # Tenta com várias configurações para aumentar as chances de reconhecimento
+            configs = [
+                r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            ]
+            
+            best_text = ""
+            best_confidence = 0
+            
+            # Tenta diferentes configurações e escolhe o melhor resultado
+            for config in configs:
+                # Executa o OCR
+                data = pytesseract.image_to_data(preprocessed_image, config=config, output_type=pytesseract.Output.DICT)
+                
+                # Extrai o texto e a confiança média
+                text_parts = []
+                confidence_sum = 0
+                confidence_count = 0
+                
+                for i in range(len(data['text'])):
+                    if data['text'][i].strip():
+                        text_parts.append(data['text'][i])
+                        confidence_sum += float(data['conf'][i]) if data['conf'][i] > 0 else 0
+                        confidence_count += 1
+                
+                # Calcula a confiança média
+                avg_confidence = confidence_sum / confidence_count if confidence_count > 0 else 0
+                
+                # Junta as partes do texto
+                text = "".join(text_parts)
+                
+                # Limpeza adicional: remove caracteres não alfanuméricos
+                text = re.sub(r'[^A-Z0-9]', '', text)
+                
+                # Se encontramos um texto melhor (mais longo ou com maior confiança)
+                if len(text) > len(best_text) or (len(text) == len(best_text) and avg_confidence > best_confidence):
+                    best_text = text
+                    best_confidence = avg_confidence
+            
+            # Tenta também o modo simples quando os outros falham
+            if not best_text:
+                # Tenta um reconhecimento direto simples
+                simple_text = pytesseract.image_to_string(
+                    preprocessed_image, 
+                    config=r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                ).strip()
+                
+                simple_text = re.sub(r'[^A-Z0-9]', '', simple_text)
+                if simple_text:
+                    best_text = simple_text
+                    best_confidence = 50.0  # Confiança padrão para reconhecimento simples
+            
+            print(f"OCR detectou: '{best_text}' com confiança {best_confidence:.1f}%")
+            
+            return best_text, best_confidence
+        except Exception as e:
+            print(f"Erro no OCR: {e}")
+            return "", 0.0
     
     def reset_stats(self):
         """
@@ -322,6 +508,63 @@ class VideoProcessor:
         # Exibe estatísticas de recortes salvos
         if self.processing_stats['saved_crops'] > 0:
             print(f"\nRecortes de objetos salvos: {self.processing_stats['saved_crops']}")
+            
+        # Exibe resultados do OCR
+        if self.ocr_results_list:
+            print("\nResultados do OCR:")
+            for i, result in enumerate(self.ocr_results_list[:10], 1):  # Limita a 10 resultados para não sobrecarregar o console
+                if result['ocr_text']:
+                    print(f"  {i}. Placa: {result['ocr_text']} (Confiança: {result['ocr_confidence']:.1f}%) - Frame {result['frame']} @ {result['timestamp']:.2f}s")
+            
+            if len(self.ocr_results_list) > 10:
+                print(f"  ... e mais {len(self.ocr_results_list) - 10} resultados")
+    
+    def save_ocr_results(self, output_file):
+        """
+        Salva os resultados do OCR em um arquivo CSV
+        
+        Args:
+            output_file (str): Caminho para o arquivo de saída
+        
+        Returns:
+            bool: True se salvou com sucesso, False caso contrário
+        """
+        if not self.ocr_results_list:
+            print("Nenhum resultado de OCR para salvar")
+            return False
+            
+        try:
+            import csv
+            
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['timestamp', 'frame', 'class', 'confidence', 'ocr_text', 'ocr_confidence', 'image_path']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for result in self.ocr_results_list:
+                    # Prepara uma versão simplificada para o CSV
+                    row = {
+                        'timestamp': result['timestamp'],
+                        'frame': result['frame'],
+                        'class': result['class'],
+                        'confidence': result['confidence'],
+                        'ocr_text': result['ocr_text'],
+                        'ocr_confidence': result['ocr_confidence'],
+                        'image_path': result['image_path']
+                    }
+                    writer.writerow(row)
+                    
+            print(f"Resultados de OCR salvos em: {output_file}")
+            
+            # Imprime alguns resultados para depuração
+            print("\nAmostra de dados salvos no CSV:")
+            for i, result in enumerate(self.ocr_results_list[:5]):
+                print(f"  {i+1}. Frame: {result['frame']}, Texto: '{result['ocr_text']}', Confiança: {result['ocr_confidence']:.1f}%")
+            
+            return True
+        except Exception as e:
+            print(f"Erro ao salvar resultados de OCR: {e}")
+            return False
     
     def get_stats(self):
         """

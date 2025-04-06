@@ -177,6 +177,8 @@ cython_debug/
 # Models
 *.pt
 yolov8l.pt
-
+*.jpg
+*.mp4
+*.csv
 #Images for testing
 Models
