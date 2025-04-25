@@ -5,6 +5,8 @@ import os
 import pytesseract
 import re
 import numpy as np
+import platform  # para detectar sistema operacional
+from ocr_utils import OcrProcessor
 
 class VideoProcessor:
     """
@@ -30,6 +32,10 @@ class VideoProcessor:
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
             
+        # Inicializa o processador OCR e regex de placa
+        self.ocr_processor = OcrProcessor(tesseract_cmd)
+        self.plate_pattern = re.compile(r'^[A-Za-z]{3}[0-9][A-Za-z0-9][0-9]{2}$')
+        
         self.processing_stats = {
             'frames_processed': 0,
             'total_time': 0,
@@ -119,8 +125,11 @@ class VideoProcessor:
             else:
                 final_output_path = output_path
             
-            # Define o codec e cria o VideoWriter
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Ou 'XVID' dependendo do sistema
+            # Define o codec de vídeo conforme o sistema operacional
+            if platform.system() == 'Windows':
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            else:
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
             out = cv2.VideoWriter(final_output_path, fourcc, fps, (width, height))
             print(f"Salvando resultado em: {final_output_path}")
         
@@ -266,13 +275,11 @@ class VideoProcessor:
                     # Extrai o recorte do objeto
                     crop = frame[y1:y2, x1:x2]
                     
-                    # Realiza o pré-processamento para OCR - agora retorna 3 versões
-                    preprocessed1, preprocessed2, preprocessed3 = self._preprocess_for_ocr(crop)
-                    
-                    # Tenta OCR em cada versão pré-processada para maximizar a chance de sucesso
-                    plate_text1, confidence1 = self._recognize_plate(preprocessed1)
-                    plate_text2, confidence2 = self._recognize_plate(preprocessed2)
-                    plate_text3, confidence3 = self._recognize_plate(preprocessed3)
+                    # Usa OcrProcessor para pré-processar e reconhecer
+                    preprocessed1, preprocessed2, preprocessed3 = self.ocr_processor.preprocess(crop)
+                    plate_text1, confidence1 = self.ocr_processor.recognize(preprocessed1)
+                    plate_text2, confidence2 = self.ocr_processor.recognize(preprocessed2)
+                    plate_text3, confidence3 = self.ocr_processor.recognize(preprocessed3)
                     
                     # Escolhe o resultado com a maior confiança ou o texto mais longo
                     best_plate_text = ""
@@ -300,167 +307,33 @@ class VideoProcessor:
                     time_str = f"{video_timestamp:.2f}".replace(".", "_")
                     plate_text_clean = best_plate_text.replace(" ", "").replace("\n", "")
                     
-                    if plate_text_clean:
-                        crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}_OCR_{plate_text_clean}.jpg"
+                    # Aplica filtro: só salva se placa bater regex e confiança > 0.01
+                    if self.plate_pattern.match(plate_text_clean) and best_confidence > 0.01:
+                        if plate_text_clean:
+                            crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}_OCR_{plate_text_clean}.jpg"
+                        else:
+                            crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
+                        crop_path = os.path.join(class_dir, crop_filename)
+                        cv2.imwrite(crop_path, crop)
+                        # Salva imagem pré-processada
+                        preproc_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_preprocessed.jpg"
+                        preproc_path = os.path.join(class_dir, preproc_filename)
+                        cv2.imwrite(preproc_path, best_preprocessed)
+                        # Armazena resultado OCR
+                        ocr_result = {
+                            'timestamp': current_time,
+                            'frame': frame_number,
+                            'class': cls_name,
+                            'confidence': conf,
+                            'ocr_text': best_plate_text,
+                            'ocr_confidence': best_confidence,
+                            'image_path': crop_path,
+                            'coordinates': (x1, y1, x2, y2)
+                        }
+                        self.ocr_results_list.append(ocr_result)
+                        self.processing_stats['saved_crops'] += 1
                     else:
-                        crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
-                    
-                    crop_path = os.path.join(class_dir, crop_filename)
-                    cv2.imwrite(crop_path, crop)
-                    
-                    # Salva também a imagem pré-processada que deu o melhor resultado
-                    preproc_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_preprocessed.jpg"
-                    preproc_path = os.path.join(class_dir, preproc_filename)
-                    cv2.imwrite(preproc_path, best_preprocessed)
-                    
-                    # Armazena os resultados do OCR
-                    ocr_result = {
-                        'timestamp': current_time,
-                        'frame': frame_number,
-                        'class': cls_name,
-                        'confidence': conf,
-                        'ocr_text': best_plate_text,
-                        'ocr_confidence': best_confidence,
-                        'image_path': crop_path,
-                        'coordinates': (x1, y1, x2, y2)
-                    }
-                    
-                    self.ocr_results_list.append(ocr_result)
-                    
-                    # Atualiza contador de recortes salvos
-                    self.processing_stats['saved_crops'] += 1
-    
-    def _preprocess_for_ocr(self, image):
-        """
-        Pré-processa a imagem para melhorar o reconhecimento de OCR
-        
-        Args:
-            image: Imagem da placa recortada
-            
-        Returns:
-            Imagem pré-processada pronta para OCR
-        """
-        try:
-            # Converte para escala de cinza
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-            # Redimensiona a imagem (opcional, mas pode ajudar com placas pequenas)
-            scale_factor = max(1, 600 / max(gray.shape[0], gray.shape[1]))
-            if scale_factor > 1:
-                width = int(gray.shape[1] * scale_factor)
-                height = int(gray.shape[0] * scale_factor)
-                gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_CUBIC)
-            
-            # Versão 1: Pré-processamento tradicional
-            # Aplicar blur para reduzir ruído
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Aplicar threshold adaptativo para binarizar a imagem
-            binary = cv2.adaptiveThreshold(
-                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-            )
-            
-            # Operações morfológicas para remover ruído
-            kernel = np.ones((3, 3), np.uint8)
-            opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-            
-            # Dilatar um pouco para conectar componentes próximos
-            preprocessed1 = cv2.dilate(opening, kernel, iterations=1)
-            
-            # Versão 2: Equalização de histograma
-            # Equaliza o histograma para melhorar o contraste
-            equalized = cv2.equalizeHist(gray)
-            
-            # Aplicar Otsu's thresholding
-            _, preprocessed2 = cv2.threshold(equalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Versão 3: Thresholding simples
-            # Aplica uma simples binarização
-            _, preprocessed3 = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Retorna a versão 1 como padrão, mas tenta as outras versões no reconhecimento
-            return preprocessed1, preprocessed2, preprocessed3
-        except Exception as e:
-            print(f"Erro no pré-processamento: {e}")
-            return image, image, image  # Retorna a imagem original em caso de erro
-    
-    def _recognize_plate(self, preprocessed_image):
-        """
-        Reconhece o texto da placa usando OCR
-        
-        Args:
-            preprocessed_image: Imagem pré-processada da placa
-            
-        Returns:
-            texto: Texto reconhecido na placa
-            confidence: Confiança da detecção
-        """
-        try:
-            # Configurações para o Tesseract
-            # PSM 7: Trata a imagem como uma única linha de texto
-            # PSM 8: Trata a imagem como uma única palavra
-            # PSM 6: Assume um único bloco de texto uniforme
-            custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            
-            # Tenta com várias configurações para aumentar as chances de reconhecimento
-            configs = [
-                r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            ]
-            
-            best_text = ""
-            best_confidence = 0
-            
-            # Tenta diferentes configurações e escolhe o melhor resultado
-            for config in configs:
-                # Executa o OCR
-                data = pytesseract.image_to_data(preprocessed_image, config=config, output_type=pytesseract.Output.DICT)
-                
-                # Extrai o texto e a confiança média
-                text_parts = []
-                confidence_sum = 0
-                confidence_count = 0
-                
-                for i in range(len(data['text'])):
-                    if data['text'][i].strip():
-                        text_parts.append(data['text'][i])
-                        confidence_sum += float(data['conf'][i]) if data['conf'][i] > 0 else 0
-                        confidence_count += 1
-                
-                # Calcula a confiança média
-                avg_confidence = confidence_sum / confidence_count if confidence_count > 0 else 0
-                
-                # Junta as partes do texto
-                text = "".join(text_parts)
-                
-                # Limpeza adicional: remove caracteres não alfanuméricos
-                text = re.sub(r'[^A-Z0-9]', '', text)
-                
-                # Se encontramos um texto melhor (mais longo ou com maior confiança)
-                if len(text) > len(best_text) or (len(text) == len(best_text) and avg_confidence > best_confidence):
-                    best_text = text
-                    best_confidence = avg_confidence
-            
-            # Tenta também o modo simples quando os outros falham
-            if not best_text:
-                # Tenta um reconhecimento direto simples
-                simple_text = pytesseract.image_to_string(
-                    preprocessed_image, 
-                    config=r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                ).strip()
-                
-                simple_text = re.sub(r'[^A-Z0-9]', '', simple_text)
-                if simple_text:
-                    best_text = simple_text
-                    best_confidence = 50.0  # Confiança padrão para reconhecimento simples
-            
-            print(f"OCR detectou: '{best_text}' com confiança {best_confidence:.1f}%")
-            
-            return best_text, best_confidence
-        except Exception as e:
-            print(f"Erro no OCR: {e}")
-            return "", 0.0
+                        continue
     
     def reset_stats(self):
         """

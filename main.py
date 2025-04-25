@@ -1,5 +1,6 @@
 from video_processor import VideoProcessor
 import os
+import platform  # detecta sistema operacional
 
 # Configurações
 VIDEO_PATH = "./Files/videos/Video2.mp4"  # Substitua pelo caminho do seu vídeo
@@ -14,9 +15,11 @@ SAVE_OBJECT_CROPS = True      # Se True, salva recortes dos objetos detectados
 CROPS_DIRECTORY = "./Output/Crops/"        # Se None, cria diretório automaticamente baseado no nome do vídeo
 SAVE_INTERVAL = 0.5           # Intervalo mínimo em segundos entre salvamentos de placas
 
-# Configuração do OCR
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Caminho para o executável do Tesseract (Windows)
-# TESSERACT_PATH = "/usr/bin/tesseract"  # Caminho para o executável do Tesseract (Linux/Mac)
+# Configuração do OCR (cross-platform)
+if platform.system() == 'Windows':
+    TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+else:
+    TESSERACT_PATH = "/usr/bin/tesseract"
 SAVE_OCR_RESULTS = True       # Se True, salva os resultados do OCR em um arquivo CSV
 
 def main():
@@ -95,20 +98,24 @@ def main():
                 else:
                     print(f"  - {cls_name}: {count} detecções, 0 imagens salvas")
     
+    # Resumo final
     total_detections = sum(stats['detected_objects'].values())
-    print(f"\nTotal de detecções: {total_detections}")
-    print(f"Tempo total de processamento: {stats['total_time']:.2f} segundos")
-    print(f"FPS médio: {stats.get('avg_fps', 0):.2f}")
-    
+    summary = [
+        f"Total de detecções: {total_detections}",
+        f"Tempo total: {stats['total_time']:.2f}s",
+        f"FPS médio: {stats.get('avg_fps', 0):.2f}"
+    ]
+    print("\n" + "\n".join(summary))
     print("\n" + "=" * 50)
     print("INSTRUÇÃO PARA VISUALIZAR OS RESULTADOS")
     print("=" * 50)
-    print(f"1. Acesse a pasta: {crops_path}")
-    print(f"2. Os resultados do OCR estão no arquivo: ocr_results.csv (se habilitado)")
-    print(f"3. Cada placa detectada tem duas imagens:")
-    print(f"   - A imagem original da placa")
-    print(f"   - A imagem pré-processada usada para OCR (sufixo '_preprocessed')")
-    print(f"4. O nome do arquivo contém o texto reconhecido pelo OCR (prefixo 'OCR_')")
+    instructions = [
+        f"1. Acesse a pasta: {crops_path}",
+        "2. Resultado OCR: ocr_results.csv",  
+        "3. Placa: original e pré-processada (_preprocessed)",
+        "4. Nome contém texto OCR (prefixo 'OCR_')"
+    ]
+    print("\n".join(instructions))
 
 if __name__ == "__main__":
     main()
