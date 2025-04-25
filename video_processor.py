@@ -7,6 +7,8 @@ import re
 import numpy as np
 import platform  # para detectar sistema operacional
 from ocr_utils import OcrProcessor
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 class VideoProcessor:
     """
@@ -49,6 +51,10 @@ class VideoProcessor:
         
         # Lista para armazenar os resultados do OCR com seus metadados
         self.ocr_results_list = []
+        
+        # Executor para OCR e I/O assíncronos
+        self._lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=4)
     
     def load_model(self):
         """
@@ -248,92 +254,63 @@ class VideoProcessor:
             
             self.processing_stats['detected_objects'][cls_name] += 1
             
-            # Salva recortes dos objetos detectados
+            # Despacha OCR + I/O para thread se habilitado e no intervalo
             if save_crops and crops_dir:
-                # Verifica o intervalo de tempo desde o último salvamento desta classe
                 current_time = video_timestamp
-                last_time = self.last_saved_time.get(cls_name, -self.save_interval)  # -interval para garantir que a primeira detecção seja salva
-                
-                # Salva apenas se passado o intervalo de tempo mínimo desde o último salvamento
-                should_save = False
+                last_time = self.last_saved_time.get(cls_name, -self.save_interval)
                 if current_time - last_time >= self.save_interval:
-                    should_save = True
                     self.last_saved_time[cls_name] = current_time
-                    
-                    # Log para depuração
-                    print(f"Salvando {cls_name} no timestamp {current_time:.2f}s (último salvo: {last_time:.2f}s)")
-                
-                if should_save:
-                    # Obtém as coordenadas da caixa delimitadora
-                    x1, y1, x2, y2 = [int(val) for val in box.xyxy[0].tolist()]
-                    
-                    # Certifica-se de que as coordenadas estão dentro dos limites do frame
-                    h, w = frame.shape[:2]
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-                    
-                    # Extrai o recorte do objeto
-                    crop = frame[y1:y2, x1:x2]
-                    
-                    # Usa OcrProcessor para pré-processar e reconhecer
-                    preprocessed1, preprocessed2, preprocessed3 = self.ocr_processor.preprocess(crop)
-                    plate_text1, confidence1 = self.ocr_processor.recognize(preprocessed1)
-                    plate_text2, confidence2 = self.ocr_processor.recognize(preprocessed2)
-                    plate_text3, confidence3 = self.ocr_processor.recognize(preprocessed3)
-                    
-                    # Escolhe o resultado com a maior confiança ou o texto mais longo
-                    best_plate_text = ""
-                    best_confidence = 0
-                    best_preprocessed = preprocessed1
-                    
-                    # Critério: texto mais longo ganha, ou maior confiança em caso de empate
-                    candidates = [
-                        (plate_text1, confidence1, preprocessed1),
-                        (plate_text2, confidence2, preprocessed2),
-                        (plate_text3, confidence3, preprocessed3)
-                    ]
-                    
-                    for text, conf, img in candidates:
-                        if len(text) > len(best_plate_text) or (len(text) == len(best_plate_text) and conf > best_confidence):
-                            best_plate_text = text
-                            best_confidence = conf
-                            best_preprocessed = img
-                    
-                    # Cria diretório para a classe se não existir
-                    class_dir = os.path.join(crops_dir, cls_name)
-                    os.makedirs(class_dir, exist_ok=True)
-                    
-                    # Adiciona o texto reconhecido ao nome do arquivo
-                    time_str = f"{video_timestamp:.2f}".replace(".", "_")
-                    plate_text_clean = best_plate_text.replace(" ", "").replace("\n", "")
-                    
-                    # Aplica filtro: só salva se placa bater regex e confiança > 0.01
-                    if self.plate_pattern.match(plate_text_clean) and best_confidence > 0.01:
-                        if plate_text_clean:
-                            crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}_OCR_{plate_text_clean}.jpg"
-                        else:
-                            crop_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
-                        crop_path = os.path.join(class_dir, crop_filename)
-                        cv2.imwrite(crop_path, crop)
-                        # Salva imagem pré-processada
-                        preproc_filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_preprocessed.jpg"
-                        preproc_path = os.path.join(class_dir, preproc_filename)
-                        cv2.imwrite(preproc_path, best_preprocessed)
-                        # Armazena resultado OCR
-                        ocr_result = {
-                            'timestamp': current_time,
-                            'frame': frame_number,
-                            'class': cls_name,
-                            'confidence': conf,
-                            'ocr_text': best_plate_text,
-                            'ocr_confidence': best_confidence,
-                            'image_path': crop_path,
-                            'coordinates': (x1, y1, x2, y2)
-                        }
-                        self.ocr_results_list.append(ocr_result)
-                        self.processing_stats['saved_crops'] += 1
-                    else:
-                        continue
+                    self.executor.submit(
+                        self._handle_detection,
+                        frame.copy(), box, cls_name, conf,
+                        frame_number, current_time, crops_dir, i
+                    )
+    
+    def _handle_detection(self, frame, box, cls_name, conf, frame_number, video_timestamp, crops_dir, i):
+        """
+        Função executada em thread: extrai crop, faz OCR, aplica filtro, salva arquivos e atualiza stats.
+        """
+        # Extrai coordenadas e crop
+        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+        h, w = frame.shape[:2]
+        x1, y1 = max(0,x1), max(0,y1)
+        x2, y2 = min(w,x2), min(h,y2)
+        crop = frame[y1:y2, x1:x2]
+        # OCR
+        pre1, pre2, pre3 = self.ocr_processor.preprocess(crop)
+        txt1, conf1 = self.ocr_processor.recognize(pre1)
+        txt2, conf2 = self.ocr_processor.recognize(pre2)
+        txt3, conf3 = self.ocr_processor.recognize(pre3)
+        # Escolhe melhor
+        best_text, best_conf = max(
+            [(txt1,conf1),(txt2,conf2),(txt3,conf3)],
+            key=lambda t: (len(t[0]), t[1])
+        )
+        text_clean = best_text.replace(" ","").replace("\n","")
+        # Filtra e salva
+        if self.plate_pattern.match(text_clean) and best_conf>0.01:
+            time_str = f"{video_timestamp:.2f}".replace(".","_")
+            class_dir = os.path.join(crops_dir, cls_name)
+            os.makedirs(class_dir, exist_ok=True)
+            filename = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}_OCR_{text_clean}.jpg" if text_clean else f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_{conf:.2f}.jpg"
+            path = os.path.join(class_dir, filename)
+            cv2.imwrite(path, crop)
+            # pré-processada
+            preproc_name = f"time{time_str}s_frame{frame_number:06d}_obj{i:03d}_{cls_name}_preprocessed.jpg"
+            cv2.imwrite(os.path.join(class_dir, preproc_name), pre1)
+            # atualiza stats com lock
+            with self._lock:
+                self.ocr_results_list.append({
+                    'timestamp': video_timestamp,
+                    'frame': frame_number,
+                    'class': cls_name,
+                    'confidence': conf,
+                    'ocr_text': best_text,
+                    'ocr_confidence': best_conf,
+                    'image_path': path,
+                    'coordinates': (x1,y1,x2,y2)
+                })
+                self.processing_stats['saved_crops'] += 1
     
     def reset_stats(self):
         """
