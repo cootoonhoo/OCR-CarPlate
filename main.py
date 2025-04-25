@@ -1,6 +1,7 @@
 import os
 from video_processor import VideoProcessor
 from config import *
+from db import init_db, save_results
 import logging
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -54,6 +55,13 @@ def main():
         csv_path = os.path.join(CROPS_DIRECTORY, "ocr_results.csv")
         processor.save_ocr_results(csv_path)
     
+    # Salva os resultados no banco de dados (SQLite ou DB URL)
+    if SAVE_TO_DB and processor.ocr_results_list:
+        init_db()
+        save_results(processor.ocr_results_list)
+        db_target = DB_URL if DB_URL else SQLITE_PATH
+        logger.info(f"Resultados OCR salvos no banco de dados: {db_target}")
+    
     # Exibe o resumo final
     logger.info("=" * 50)
     logger.info("RESUMO DO PROCESSAMENTO")
@@ -93,7 +101,8 @@ def main():
         f"1. Acesse a pasta: {crops_path}",
         "2. Resultado OCR: ocr_results.csv",  
         "3. Placa: original e pré-processada (_preprocessed)",
-        "4. Nome contém texto OCR (prefixo 'OCR_')"
+        "4. Nome contém texto OCR (prefixo 'OCR_')",
+        "5. Resultados no banco de dados: {db_target}"
     ]
     for line in instructions:
         logger.info(line)

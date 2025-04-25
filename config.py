@@ -33,5 +33,10 @@ if not TESSERACT_PATH:
     else:
         TESSERACT_PATH = '/usr/bin/tesseract'
 
+# Banco de dados
+DB_URL = os.getenv('DB_URL', '')  # exemplo: postgresql://user:pass@host:port/dbname
+SQLITE_PATH = os.getenv('SQLITE_PATH', './Output/ocr_results.db')
+SAVE_TO_DB = os.getenv('SAVE_TO_DB', 'False').lower() in ('true','1','yes')
+
 # Logging
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
